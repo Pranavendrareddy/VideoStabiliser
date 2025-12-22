@@ -98,7 +98,8 @@ def get_shaky_trajectory(video_path = "video.mp4"):
     return Cx, Cy, Ca
 
 
-def smooth_trajectory(Cx, Cy, Ca, max_trans=100, max_rot = 5):
+def smooth_trajectory(Cx, Cy, Ca, max_trans=100, max_rot = 2):
+
     n = len(Cx)
     solver = pywraplp.Solver.CreateSolver('GLOP')
     if not solver:
@@ -211,6 +212,7 @@ def smooth_trajectory(Cx, Cy, Ca, max_trans=100, max_rot = 5):
 
 def stabilise_video(Cx, Cy, Ca, smooth_Cx, smooth_Cy, smooth_Ca, video_path="video.mp4", output_path="stabilized.mp4"):
     cap = cv2.VideoCapture(video_path)
+
     if not cap.isOpened():
         raise RuntimeError("Could not open video")
 
@@ -248,8 +250,6 @@ def stabilise_video(Cx, Cy, Ca, smooth_Cx, smooth_Cy, smooth_Ca, video_path="vid
 
     cap.release()
     out.release()
-
-
 
 # if __name__ == "__main__":
 #     Cx, Cy, Ca = get_shaky_trajectory()
