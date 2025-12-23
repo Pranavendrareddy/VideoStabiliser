@@ -3,9 +3,56 @@ import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from ortools.linear_solver import pywraplp
+from scipy.signal import medfilt
 
 import subprocess
 import os
+
+def fix_border(frame, scale=1.08):
+    h, w = frame.shape[:2]
+    T = cv2.getRotationMatrix2D((w//2, h//2), 0, scale)
+    return cv2.warpAffine(frame, T, (w, h))
+
+def fix_border_to_stable2(frame, dx, dy, da, scale=1.1):
+    h, w = frame.shape[:2]
+    center_x = w/2 + dx   # shift the center by the translation
+    center_y = h/2 + dy
+    T = cv2.getRotationMatrix2D((center_x, center_y), da, scale)
+    return cv2.warpAffine(frame, T, (w, h))
+
+def fix_border_to_stable(frame, dx, dy, da, scale=1.1):
+
+    h, w = frame.shape[:2]
+
+    # Convert rotation to degrees
+    angle_deg = np.degrees(da)
+
+    # Compute the center of the frame around which to rotate
+    # Shift the rotation center so the "stable point" is at the middle
+    center = (w / 2 + dx, h / 2 + dy)
+
+    # Construct rotation + scale matrix
+    M = cv2.getRotationMatrix2D(center, angle_deg, scale)
+
+    # Apply affine transformation
+    stabilized = cv2.warpAffine(
+        frame, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE  # optionally use BORDER_REFLECT for smoother edges
+    )
+
+    # Optional: crop extra edges to fully remove borders
+    # Compute crop region after scaling
+    crop_w = int(w / scale)
+    crop_h = int(h / scale)
+    x1 = (w - crop_w) // 2
+    y1 = (h - crop_h) // 2
+    stabilized = stabilized[y1:y1+crop_h, x1:x1+crop_w]
+
+    # Resize back to original frame size
+    stabilized = cv2.resize(stabilized, (w, h))
+
+    return stabilized
 
 def convert_video(input_path, output_path="converted.mp4"):
     cmd = [
@@ -22,7 +69,7 @@ def convert_video(input_path, output_path="converted.mp4"):
     return output_path
 
 
-def get_shaky_trajectory(video_path = "video.mp4"):
+def get_shaky_trajectory(video_path = "video.mp4", progress_callback=None):
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
@@ -39,7 +86,7 @@ def get_shaky_trajectory(video_path = "video.mp4"):
         raise RuntimeError("Empty video")
 
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    prev_points = cv2.goodFeaturesToTrack(prev_gray, 150, 0.01, 30, blockSize=3)
+    prev_points = cv2.goodFeaturesToTrack(prev_gray, 200, 0.01, 30, blockSize=3)
 
     Cx, Cy, Ca = [0.0], [0.0], [0.0]
 
@@ -70,8 +117,21 @@ def get_shaky_trajectory(video_path = "video.mp4"):
         valid_prev = prev_points[status.flatten() == 1]
         valid_curr = curr_points[status.flatten() == 1]
 
-        M, _ = cv2.estimateAffine2D(valid_prev, valid_curr)
-        dx, dy, da = M[0, 2], M[1, 2], np.arctan2(M[1, 0], M[0, 0])
+        M, inliers = cv2.estimateAffinePartial2D(
+            valid_prev,
+            valid_curr,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3,
+            confidence=0.99
+        )
+
+        if M is None:
+            dx = dy = da = 0
+        else:
+            dx = M[0, 2]
+            dy = M[1, 2]
+            da = np.arctan2(M[1, 0], M[0, 0])
+
         Cx.append(Cx[-1] + dx)
         Cy.append(Cy[-1] + dy)
         Ca.append(Ca[-1] + da)
@@ -79,8 +139,20 @@ def get_shaky_trajectory(video_path = "video.mp4"):
         prev_gray = gray
         prev_points = valid_curr.reshape(-1, 1, 2)
 
+        if len(prev_points) < 80:
+            prev_points = cv2.goodFeaturesToTrack(
+                prev_gray,
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=30,
+                blockSize=3
+            )
+
         frame_counter += 1
         pbar.update(1)
+        if progress_callback:
+            # 50% of progress is assigned to analysis
+            progress_callback(int(50 * frame_counter / total_frames))
 
     # plt.figure(figsize=(10, 4))
     # plt.plot(Cx, label="x")
@@ -98,9 +170,10 @@ def get_shaky_trajectory(video_path = "video.mp4"):
     return Cx, Cy, Ca
 
 
-def smooth_trajectory(Cx, Cy, Ca, max_trans=100, max_rot = 2):
+def smooth_trajectory(Cx, Cy, Ca, max_trans=200, max_rot = 0.5):
 
     n = len(Cx)
+
     solver = pywraplp.Solver.CreateSolver('GLOP')
     if not solver:
         raise RuntimeError("Could not create solver GLOP")
@@ -184,13 +257,13 @@ def smooth_trajectory(Cx, Cy, Ca, max_trans=100, max_rot = 2):
     objective.SetMinimization()
 
     for v in Vx + Vy + Va:
-        objective.SetCoefficient(v, 10)
+        objective.SetCoefficient(v, 50)
 
     for a in Ax + Ay + Aa:
-        objective.SetCoefficient(a, 100)
+        objective.SetCoefficient(a, 200)
 
     for j in Jx + Jy + Ja:
-        objective.SetCoefficient(j, 1000)
+        objective.SetCoefficient(j, 3000)
 
     print(f"Solving with {solver.SolverVersion()}")
     result_status = solver.Solve()
@@ -210,7 +283,7 @@ def smooth_trajectory(Cx, Cy, Ca, max_trans=100, max_rot = 2):
 
     return smooth_Cx, smooth_Cy, smooth_Ca
 
-def stabilise_video(Cx, Cy, Ca, smooth_Cx, smooth_Cy, smooth_Ca, video_path="video.mp4", output_path="stabilized.mp4"):
+def stabilise_video(Cx, Cy, Ca, smooth_Cx, smooth_Cy, smooth_Ca, video_path="video.mp4", output_path="stabilized.mp4", progress_callback=None):
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
@@ -220,17 +293,34 @@ def stabilise_video(Cx, Cy, Ca, smooth_Cx, smooth_Cy, smooth_Ca, video_path="vid
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
+    n_frames = len(Cx)
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    dx_all = medfilt([smooth_Cx[i] - Cx[i] for i in range(n_frames)], 5)
+    dy_all = medfilt([smooth_Cy[i] - Cy[i] for i in range(n_frames)], 5)
+    da_all = medfilt([smooth_Ca[i] - Ca[i] for i in range(n_frames)], 5)
 
     for i in tqdm(range(len(Cx)), desc="Stabilizing"):
         ret, frame = cap.read()
         if not ret:
             break
 
-        dx = smooth_Cx[i] - Cx[i]
-        dy = smooth_Cy[i] - Cy[i]
-        da = smooth_Ca[i] - Ca[i]
+        if i == 0:
+            dx = dy = da = 0
+        else:
+            dx = dx_all[i]
+            dy = dy_all[i]
+            da = da_all[i]
+
+            dx = smooth_Cx[i] - Cx[i]
+            dy = smooth_Cy[i] - Cy[i]
+            da = smooth_Ca[i] - Ca[i]
+
+            # max_shift = 30
+            # dx = np.clip(dx, -max_shift, max_shift)
+            # dy = np.clip(dy, -max_shift, max_shift)
 
         cos_a = np.cos(da)
         sin_a = np.sin(da)
@@ -243,10 +333,16 @@ def stabilise_video(Cx, Cy, Ca, smooth_Cx, smooth_Cy, smooth_Ca, video_path="vid
         stabilized = cv2.warpAffine(
             frame, M, (w, h),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT
+            borderMode=cv2.BORDER_REPLICATE
         )
+        stabilized = fix_border_to_stable(stabilized, dx, dy, da)
+        #stabilized = fix_border(stabilized)
+        #print("shift pix", np.max(np.abs(dx)), np.max(np.abs(dy)))
 
         out.write(stabilized)
+
+        if progress_callback:
+            progress_callback(int(100 * (i + 1) / n_frames))
 
     cap.release()
     out.release()

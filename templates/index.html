@@ -1,15 +1,63 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <title>Video Stabilizer</title>
+<style>
+#container {
+  width: 100%;
+  background: #ddd;
+  margin-top: 20px;
+}
+#bar {
+  width: 0%;
+  height: 25px;
+  background: #4caf50;
+}
+</style>
 </head>
 <body>
-    <h1>Upload video to stabilize</h1>
 
-    <form method="POST" enctype="multipart/form-data">
-        <input type="file" name="video" required>
-        <br><br>
-        <button type="submit">Stabilize</button>
-    </form>
+<h2>Upload Video</h2>
+<form id="uploadForm">
+    <input type="file" name="video" required>
+    <button type="submit">Start Stabilization</button>
+</form>
+
+<div id="container">
+  <div id="bar"></div>
+</div>
+
+<!-- Make sure the container ID matches what JS is using -->
+<div id="links" style="margin-top:20px;"></div>
+
+<script>
+const form = document.getElementById("uploadForm");
+form.addEventListener("submit", function(e){
+    e.preventDefault();
+    const data = new FormData(form);
+
+    fetch("/start", {method: "POST", body: data})
+        .then(res => res.json())
+        .then(() => pollProgress());
+});
+
+function pollProgress(){
+    fetch("/progress")
+        .then(res => res.json())
+        .then(data => {
+            document.getElementById("bar").style.width = data.value + "%";
+
+            if(data.value < 100){
+                setTimeout(pollProgress, 200);
+            } else {
+                // show both links when progress reaches 100%
+                document.getElementById("links").innerHTML = `
+                    <a href="/download">Download Stabilized Video</a><br>
+                    <a href="/plot">Open Stabilization Graph</a>
+                `;
+            }
+        });
+}
+</script>
+
 </body>
 </html>
